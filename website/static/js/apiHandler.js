@@ -182,7 +182,7 @@ async function updateSaveProgress(id) {
 
 async function handleUpload2(id) {
     console.log(id)
-    document.getElementById('upload-status').innerText = 'Status: Uploading To Telegram Server';
+    document.getElementById('upload-status').innerText = 'Status: Uploading To Cloud Server';
     progressBar.style.width = '0%';
     uploadPercent.innerText = 'Progress : 0%';
 

@@ -1,13 +1,11 @@
 from pathlib import Path
-from config import DATABASE_BACKUP_TIME, STORAGE_CHANNEL, DATABASE_BACKUP_MSG_ID
-from utils.clients import get_client
+import config
 from pyrogram.types import InputMediaDocument
 import pickle, os, random, string, asyncio
-from utils.extra import get_current_utc_time
 from utils.logger import Logger
-from datetime import datetime
+from datetime import datetime, timezone
 
-logger = Logger("directoryHandler")
+logger = Logger(__name__)
 
 cache_dir = Path("./cache")
 cache_dir.mkdir(parents=True, exist_ok=True)
@@ -24,6 +22,10 @@ def getRandomID():
             return id
 
 
+def get_current_utc_time():
+    return datetime.now(timezone.utc).strftime("Date - %Y-%m-%d | Time - %H:%M:%S")
+
+
 class Folder:
     def __init__(self, name: str, path) -> None:
         self.name = name
@@ -36,6 +38,7 @@ class Folder:
         self.trash = False
         self.path = path[:-1] if path[-1] == "/" else path
         self.upload_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.auth_hashes = []
 
 
 class File:
@@ -101,8 +104,13 @@ class NewDriveData:
 
         self.save()
 
-    def get_directory(self, path: str) -> Folder:
-        folder_data = self.contents["/"]
+    def get_directory(
+        self, path: str, is_admin: bool = True, auth: str = None
+    ) -> Folder:
+        folder_data: Folder = self.contents["/"]
+        auth_success = False
+        auth_home_path = None
+
         if path != "/":
             path = path.strip("/")
 
@@ -113,7 +121,39 @@ class NewDriveData:
 
             for folder in path:
                 folder_data = folder_data.contents[folder]
+
+                if auth in folder_data.auth_hashes:
+                    auth_success = True
+                    auth_home_path = (
+                        "/" + folder_data.path.strip("/") + "/" + folder_data.id
+                    )
+
+        if not is_admin and not auth_success:
+            return None
+
+        if auth_success:
+            return folder_data, auth_home_path
+
         return folder_data
+
+    def get_folder_auth(self, path: str) -> None:
+        auth = getRandomID()
+        folder_data: Folder = self.contents["/"]
+
+        if path != "/":
+            path = path.strip("/")
+
+            if "/" in path:
+                path = path.split("/")
+            else:
+                path = [path]
+
+            for folder in path:
+                folder_data = folder_data.contents[folder]
+
+        folder_data.auth_hashes.append(auth)
+        self.save()
+        return auth
 
     def get_file(self, path) -> File:
         if len(path.strip("/").split("/")) > 0:
@@ -200,7 +240,22 @@ class NewDriveData:
         return search_results
 
 
+class NewBotMode:
+    def __init__(self, drive_data: NewDriveData) -> None:
+        self.drive_data = drive_data
+
+        # Set the current folder to root directory by default
+        self.current_folder = "/"
+        self.current_folder_name = "/ (root directory)"
+
+    def set_folder(self, folder_path: str, name: str) -> None:
+        self.current_folder = folder_path
+        self.current_folder_name = name
+        self.drive_data.save()
+
+
 DRIVE_DATA: NewDriveData = None
+BOT_MODE: NewBotMode = None
 
 
 # Function to backup the drive data to telegram
@@ -209,38 +264,71 @@ async def backup_drive_data():
     logger.info("Starting backup drive data task")
 
     while True:
-        await asyncio.sleep(DATABASE_BACKUP_TIME)  # Backup the data every 24 hours
-
-        if DRIVE_DATA.isUpdated == False:
-            continue
-
-        logger.info("Backing up drive data to telegram")
-        client = get_client()
-        time_text = f"📅 **Last Updated :** {get_current_utc_time()} (UTC +00:00)"
-        msg = await client.edit_message_media(
-            STORAGE_CHANNEL,
-            DATABASE_BACKUP_MSG_ID,
-            media=InputMediaDocument(
-                drive_cache_path,
-                caption=f"🔐 **TG Drive Data Backup File**\n\nDo not edit or delete this message. This is a backup file for the tg drive data.\n\n{time_text}",
-            ),
-            file_name="drive.data",
-        )
-        DRIVE_DATA.isUpdated = False
         try:
-            await msg.pin()
-        except:
-            pass
+            await asyncio.sleep(
+                config.DATABASE_BACKUP_TIME
+            )  # Backup the data every 24 hours
+
+            if DRIVE_DATA.isUpdated == False:
+                continue
+
+            logger.info("Backing up drive data to telegram")
+            from utils.clients import get_client
+
+            client = get_client()
+            time_text = f"📅 **Last Updated :** {get_current_utc_time()} (UTC +00:00)"
+            msg = await client.edit_message_media(
+                config.STORAGE_CHANNEL,
+                config.DATABASE_BACKUP_MSG_ID,
+                media=InputMediaDocument(
+                    drive_cache_path,
+                    caption=f"🔐 **TG Drive Data Backup File**\n\nDo not edit or delete this message. This is a backup file for the tg drive data.\n\n{time_text}",
+                ),
+                file_name="drive.data",
+            )
+            DRIVE_DATA.isUpdated = False
+            try:
+                await msg.pin()
+            except:
+                pass
+        except Exception as e:
+            logger.error("Backup Error : " + str(e))
+
+
+async def init_drive_data():
+    # auth_hashes attribute is added to all the folders in the drive data if it doesn't exist
+
+    global DRIVE_DATA
+
+    root_dir = DRIVE_DATA.get_directory("/")
+    if not hasattr(root_dir, "auth_hashes"):
+        root_dir.auth_hashes = []
+
+    def traverse_directory(folder):
+        for item in folder.contents.values():
+            if item.type == "folder":
+                traverse_directory(item)
+
+                if not hasattr(item, "auth_hashes"):
+                    item.auth_hashes = []
+
+    traverse_directory(root_dir)
+
+    DRIVE_DATA.save()
 
 
 async def loadDriveData():
-    global DRIVE_DATA
+    global DRIVE_DATA, BOT_MODE
 
     # Checking if the backup file exists on telegram
+    from utils.clients import get_client
+
     client = get_client()
     try:
         try:
-            msg = await client.get_messages(STORAGE_CHANNEL, DATABASE_BACKUP_MSG_ID)
+            msg = await client.get_messages(
+                config.STORAGE_CHANNEL, config.DATABASE_BACKUP_MSG_ID
+            )
         except Exception as e:
             logger.error(e)
             raise Exception("Failed to get DATABASE_BACKUP_MSG_ID on telegram")
@@ -258,3 +346,13 @@ async def loadDriveData():
         logger.info("Creating new drive.data file")
         DRIVE_DATA = NewDriveData({"/": Folder("/", "/")}, [])
         DRIVE_DATA.save()
+
+    # For updating the changes in already existing old backup drive.data file
+    await init_drive_data()
+
+    # Start Bot Mode
+    if config.MAIN_BOT_TOKEN:
+        from utils.bot_mode import start_bot_mode
+
+        BOT_MODE = NewBotMode(DRIVE_DATA)
+        await start_bot_mode(DRIVE_DATA, BOT_MODE)

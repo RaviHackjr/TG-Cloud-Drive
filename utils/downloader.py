@@ -1,91 +1,85 @@
-import aiohttp, aiofiles, asyncio
-from utils.extra import parse_content_disposition
+import os
+import aiohttp, asyncio
+from utils.extra import get_filename
 from utils.logger import Logger
 from pathlib import Path
-from urllib.parse import unquote_plus
 from utils.uploader import start_file_uploader
-
+from techzdl import TechZDL
 
 logger = Logger(__name__)
 
 DOWNLOAD_PROGRESS = {}
+STOP_DOWNLOAD = []
+
+cache_dir = Path("./cache")
+cache_dir.mkdir(parents=True, exist_ok=True)
 
 
-async def download_file(url, id, path):
+async def download_progress_callback(status, current, total, id):
     global DOWNLOAD_PROGRESS
 
-    cache_dir = Path("./cache")
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    DOWNLOAD_PROGRESS[id] = (
+        status,
+        current,
+        total,
+    )
+
+
+async def download_file(url, id, path, filename, singleThreaded):
+    global DOWNLOAD_PROGRESS, STOP_DOWNLOAD
 
     logger.info(f"Downloading file from {url}")
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                total_size = int(response.headers["Content-Length"])
-                try:
-                    if response.headers.get("Content-Disposition"):
-                        filename = parse_content_disposition(
-                            response.headers["Content-Disposition"]
-                        )
-                    else:
-                        filename = unquote_plus(url.strip("/").split("/")[-1])
-                except:
-                    filename = unquote_plus(url.strip("/").split("/")[-1])
+        downloader = TechZDL(
+            url,
+            output_dir=cache_dir,
+            debug=False,
+            progress_callback=download_progress_callback,
+            progress_args=(id,),
+            max_retries=5,
+            single_threaded=singleThreaded,
+        )
+        await downloader.start(in_background=True)
 
-                ext = filename.lower().split(".")[-1]
-                file_location = cache_dir / f"{id}.{ext}"
+        await asyncio.sleep(5)
 
-                size_downloaded = 0
+        while downloader.is_running:
+            if id in STOP_DOWNLOAD:
+                logger.info(f"Stopping download {id}")
+                await downloader.stop()
+                return
+            await asyncio.sleep(1)
 
-                async with aiofiles.open(file_location, "wb") as f:
-                    while True:
-                        chunk = await response.content.read(1024)
-                        if not chunk:
-                            break
-                        size_downloaded += len(chunk)
-                        DOWNLOAD_PROGRESS[id] = (
-                            "running",
-                            size_downloaded,
-                            total_size,
-                        )
-                        await f.write(chunk)
+        if downloader.download_success is False:
+            raise downloader.download_error
 
-                DOWNLOAD_PROGRESS[id] = ("completed", total_size, total_size)
-                logger.info(f"File downloaded to {file_location}")
+        DOWNLOAD_PROGRESS[id] = (
+            "completed",
+            downloader.total_size,
+            downloader.total_size,
+        )
 
-                asyncio.create_task(
-                    start_file_uploader(file_location, id, path, filename, total_size)
-                )
+        logger.info(f"File downloaded to {downloader.output_path}")
+
+        asyncio.create_task(
+            start_file_uploader(
+                downloader.output_path, id, path, filename, downloader.total_size
+            )
+        )
     except Exception as e:
         DOWNLOAD_PROGRESS[id] = ("error", 0, 0)
         logger.error(f"Failed to download file: {url} {e}")
 
 
 async def get_file_info_from_url(url):
-    logger.info(f"Getting file info from {url}")
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            logger.info(str(response.headers))
-            try:
-                if response.headers.get("Content-Disposition"):
-                    filename = parse_content_disposition(
-                        response.headers["Content-Disposition"]
-                    )
-                else:
-                    filename = unquote_plus(url.strip("/").split("/")[-1])
-            except:
-                filename = unquote_plus(url.strip("/").split("/")[-1])
-
-            try:
-                size = int(response.headers["Content-Length"])
-                if size == 0:
-                    raise Exception("File size is 0")
-            except:
-                raise Exception(
-                    "Failed to get file size, Content-Length Headers Not Found"
-                )
-
-            logger.info(f"Got file info from url: {filename} ({size} bytes)")
-            return {"file_size": size, "file_name": filename}
+    downloader = TechZDL(
+        url,
+        output_dir=cache_dir,
+        debug=False,
+        progress_callback=download_progress_callback,
+        progress_args=(id,),
+        max_retries=5,
+    )
+    file_info = await downloader.get_file_info()
+    return {"file_size": file_info["total_size"], "file_name": file_info["filename"]}
